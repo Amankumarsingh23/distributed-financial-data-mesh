@@ -4,7 +4,7 @@
 
 ### Cloud-Native ETL Pipeline for Quantitative Research & ML
 
-[![Pipeline](https://github.com/YOUR_USERNAME/financial-data-mesh/actions/workflows/pipeline.yml/badge.svg)](https://github.com/YOUR_USERNAME/financial-data-mesh/actions/workflows/pipeline.yml)
+[![Pipeline](https://github.com/Amankumarsingh23/distributed-financial-data-mesh/actions/workflows/pipeline.yml/badge.svg)](https://github.com/Amankumarsingh23/distributed-financial-data-mesh/actions/workflows/pipeline.yml)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://python.org)
 [![GCP](https://img.shields.io/badge/Google_Cloud-4285F4?logo=google-cloud&logoColor=white)](https://cloud.google.com)
 [![BigQuery](https://img.shields.io/badge/BigQuery-669DF6?logo=google-bigquery&logoColor=white)](https://cloud.google.com/bigquery)
