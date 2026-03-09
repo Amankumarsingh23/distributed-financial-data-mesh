@@ -1,0 +1,242 @@
+name: Financial Data Mesh — ETL Pipeline
+
+on:
+  schedule:
+    # Run every weekday at 6:00 PM UTC (after US market close)
+    - cron: "0 18 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      run_date:
+        description: "Override run date (YYYYMMDD). Leave blank for today."
+        required: false
+        default: ""
+      tickers:
+        description: "Comma-separated tickers to override defaults. Leave blank for all."
+        required: false
+        default: ""
+      skip_infra:
+        description: "Skip infrastructure provisioning (use existing resources)"
+        type: boolean
+        default: false
+
+env:
+  GCP_PROJECT_ID:      ${{ secrets.GCP_PROJECT_ID }}
+  GCS_BUCKET_NAME:     ${{ secrets.GCS_BUCKET_NAME }}
+  BQ_DATASET:          financial_data_mesh
+  GCP_REGION:          us-central1
+  DATAPROC_CLUSTER:    financial-mesh-cluster
+  TIINGO_API_KEY:      ${{ secrets.TIINGO_API_KEY }}
+  PYTHON_VERSION:      "3.10"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 1: Lint & tests
+  # ──────────────────────────────────────────────────────────────────────────
+  quality-gate:
+    name: "Quality Gate"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dev dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 pytest pytest-cov
+
+      - name: Lint (flake8)
+        run: flake8 src/ --max-line-length=120 --ignore=E501,W503
+
+      - name: Run unit tests
+        run: pytest tests/ -v --cov=src --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+        continue-on-error: true
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 2: Provision GCP infrastructure
+  # ──────────────────────────────────────────────────────────────────────────
+  provision-infrastructure:
+    name: "Provision GCP Infrastructure"
+    runs-on: ubuntu-latest
+    needs: quality-gate
+    if: ${{ github.event.inputs.skip_infra != 'true' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Provision GCS + BigQuery + Dataproc
+        run: python src/infrastructure/automate.py --action provision
+
+      - name: Upload PySpark script to GCS
+        run: |
+          gsutil cp src/processing/spark_transform.py \
+            gs://${{ env.GCS_BUCKET_NAME }}/scripts/spark_transform.py
+          echo "✅ PySpark script staged to GCS"
+
+      - name: Deploy BigQuery SQL Views
+        run: python src/analytics/deploy_views.py
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 3: Ingest raw data from Tiingo API → GCS
+  # ──────────────────────────────────────────────────────────────────────────
+  ingest-raw-data:
+    name: "Ingest: Tiingo API → GCS"
+    runs-on: ubuntu-latest
+    needs: provision-infrastructure
+    outputs:
+      run_date: ${{ steps.set-date.outputs.run_date }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set run date
+        id: set-date
+        run: |
+          if [ -n "${{ github.event.inputs.run_date }}" ]; then
+            echo "run_date=${{ github.event.inputs.run_date }}" >> $GITHUB_OUTPUT
+          else
+            echo "run_date=$(date -u +%Y%m%d)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch stock data from Tiingo
+        run: |
+          python src/ingestion/fetch_data.py
+        env:
+          TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
+          GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME }}
+
+      - name: Verify raw data in GCS
+        run: |
+          COUNT=$(gsutil ls gs://${{ env.GCS_BUCKET_NAME }}/raw/stocks/${{ steps.set-date.outputs.run_date }}/ | wc -l)
+          echo "Files ingested: $COUNT"
+          if [ "$COUNT" -lt 5 ]; then
+            echo "❌ Too few files ingested ($COUNT). Aborting."
+            exit 1
+          fi
+          echo "✅ Raw data verified: $COUNT ticker files"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 4: PySpark transform on Dataproc → BigQuery
+  # ──────────────────────────────────────────────────────────────────────────
+  transform-and-load:
+    name: "Transform: Dataproc PySpark → BigQuery"
+    runs-on: ubuntu-latest
+    needs: ingest-raw-data
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Submit Dataproc PySpark Job
+        run: |
+          gcloud dataproc jobs submit pyspark \
+            gs://${{ env.GCS_BUCKET_NAME }}/scripts/spark_transform.py \
+            --cluster=${{ env.DATAPROC_CLUSTER }} \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --jars=gs://spark-lib/bigquery/spark-bigquery-with-dependencies_2.12-0.32.0.jar \
+            -- \
+            --bucket=${{ env.GCS_BUCKET_NAME }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --dataset=${{ env.BQ_DATASET }} \
+            --run_date=${{ needs.ingest-raw-data.outputs.run_date }}
+
+      - name: Validate BigQuery row count
+        run: |
+          ROW_COUNT=$(bq query --nouse_legacy_sql --format=csv \
+            "SELECT COUNT(*) FROM \`${{ env.GCP_PROJECT_ID }}.${{ env.BQ_DATASET }}.stock_features\`
+             WHERE pipeline_run='${{ needs.ingest-raw-data.outputs.run_date }}'" \
+            | tail -1)
+          echo "Rows loaded for run ${{ needs.ingest-raw-data.outputs.run_date }}: $ROW_COUNT"
+          if [ "$ROW_COUNT" -lt 100 ]; then
+            echo "❌ Row count too low ($ROW_COUNT). Pipeline may have failed."
+            exit 1
+          fi
+          echo "✅ BigQuery validation passed: $ROW_COUNT rows"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 5: Teardown cluster to avoid idle charges
+  # ──────────────────────────────────────────────────────────────────────────
+  teardown-cluster:
+    name: "Teardown Dataproc Cluster"
+    runs-on: ubuntu-latest
+    needs: transform-and-load
+    if: always()  # Always run, even on failure, to avoid orphaned clusters
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Delete Dataproc cluster
+        run: |
+          gcloud dataproc clusters delete ${{ env.DATAPROC_CLUSTER }} \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --quiet || echo "Cluster already deleted or not found."
+          echo "✅ Dataproc cluster teardown complete"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 6: Notify on failure
+  # ──────────────────────────────────────────────────────────────────────────
+  notify-on-failure:
+    name: "Failure Notification"
+    runs-on: ubuntu-latest
+    needs: [ingest-raw-data, transform-and-load]
+    if: failure()
+    steps:
+      - name: Log failure
+        run: |
+          echo "❌ Financial Data Mesh pipeline FAILED"
+          echo "Run: ${{ github.run_id }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Branch: ${{ github.ref }}"

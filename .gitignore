@@ -1,0 +1,36 @@
+# Secrets — NEVER commit
+.env
+*.json
+service_account*.json
+*credentials*.json
+*key*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# GCP
+.gcloud/
+
+# Data (don't commit raw files)
+data/
+*.parquet
+*.csv
+*.json.gz
